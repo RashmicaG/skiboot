@@ -940,10 +940,22 @@ bool xscom_ok(void)
 #define L2_PRD_PURGE_CMD_TRIGGER 0x8000000000000000
 #define L3_PRD_PURGE_REG 0x1180E
 #define L3_PRD_PURGE_REQ 0x8000000000000000
+#define TIMEOUT_MS 2
 
-static void flush_l2_caches(uint32_t chip_id, uint32_t core_id)
+static inline bool time_expired(unsigned long start)
 {
-	int rc;
+	unsigned long time = tb_to_msecs(mftb());
+
+	if (time - start > TIMEOUT_MS) {
+		return true;
+	}
+	return false;
+}
+
+static int flush_l2_caches(uint32_t chip_id, uint32_t core_id)
+{
+	int rc, timeout = 0;
+	unsigned long start_time;
 	uint64_t val = L2_PRD_PURGE_CMD_REG_BUSY;
 	uint64_t addr = XSCOM_ADDR_P9_EX(core_id, L2_PRD_PURGE_CMD_REG);
 
@@ -952,12 +964,17 @@ static void flush_l2_caches(uint32_t chip_id, uint32_t core_id)
 	if (rc) {
 		prlog(PR_ERR, "FLUSH L2 on core 0x%x: XSCOM write_mask failed %i\n", core_id, rc);
 	}
-	while (val & L2_PRD_PURGE_CMD_REG_BUSY)	{
+	start_time = tb_to_msecs(mftb());
+	while ((val & L2_PRD_PURGE_CMD_REG_BUSY) && !(timeout = time_expired(start_time))) {
 		rc = xscom_read(chip_id, addr, &val);
 		if (rc) {
 			prlog(PR_ERR, "FLUSH L2 on core 0x%x: XSCOM read failed %i\n", core_id, rc);
 			break;
 		}
+	}
+	if (timeout) {
+		prlog(PR_ERR, "FLUSH L3 on core 0x%x timed out %i\n", core_id, rc);
+		return OPAL_BUSY;
 	}
 
 	/* We have to clear the trigger bit ourselves */
@@ -965,13 +982,14 @@ static void flush_l2_caches(uint32_t chip_id, uint32_t core_id)
 	rc = xscom_write(chip_id, addr, val);
 	if (rc)
 		prlog(PR_ERR, "FLUSH L2 on core 0x%x: XSCOM write failed %i\n", core_id, rc);
-	return;
+	return 0;
 
 }
 
-static void flush_l3_caches(uint32_t chip_id, uint32_t core_id)
+static int flush_l3_caches(uint32_t chip_id, uint32_t core_id)
 {
-	int rc;
+	int rc, timeout = 0;
+	unsigned long start_time;
 	uint64_t val = L3_PRD_PURGE_REQ;
 	uint64_t addr = XSCOM_ADDR_P9_EX(core_id, L3_PRD_PURGE_REG);
 
@@ -981,20 +999,30 @@ static void flush_l3_caches(uint32_t chip_id, uint32_t core_id)
 	}
 
 	/* Trigger bit is automatically set to zero when flushing is done*/
-	while (val & L3_PRD_PURGE_REQ) {
+	start_time = tb_to_msecs(mftb());
+	while ((val & L3_PRD_PURGE_REQ) && !(timeout = time_expired(start_time) )) {
 		rc = xscom_read(chip_id, addr, &val);
 		if (rc) {
 			prlog(PR_ERR, "FLUSH L3 on core 0x%x: XSCOM read failed %i\n", core_id, rc);
 			break;
 		}
 	}
-	return;
+	if (timeout) {
+		prlog(PR_ERR, "FLUSH L3 on core 0x%x timed out %i\n", core_id, rc);
+		return OPAL_BUSY;
+	}
+
+	return 0;
 }
 
 int flush_caches(void)
 {
+	int rc = 0;
 	struct cpu_thread *t;
 	uint64_t chip_id, core_id, prev_core_id = 0xdeadbeef;
+
+	if ((mfspr(SPR_PVR) & PVR_TYPE_P9) != PVR_TYPE_P9)
+		return OPAL_UNSUPPORTED;
 
 	for_each_cpu(t) {
 		/* Only need to do it once per core chiplet */
@@ -1004,11 +1032,11 @@ int flush_caches(void)
 		prev_core_id = core_id;
 		chip_id = t->chip_id;
 
-		flush_l2_caches(chip_id, core_id);
-		flush_l3_caches(chip_id, core_id);
+		rc |= flush_l2_caches(chip_id, core_id);
+		rc |= flush_l3_caches(chip_id, core_id);
 	}
 
-	return 0;
+	return rc;
 }
 
 
